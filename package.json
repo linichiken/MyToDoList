@@ -1,0 +1,21 @@
+{
+  "name": "my-todo-list",
+  "private": true,
+  "version": "1.0.0",
+  "description": "多人協作待辦清單 (Firebase Google Auth + Cloud Firestore)",
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 5173",
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "firebase": "^10.14.1",
+    "htm": "^3.1.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "vite": "^5.4.8"
+  }
+}

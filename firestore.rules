@@ -1,0 +1,292 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// This security rules file assumes the following data structures:
+//
+// Collection: users
+// Document ID: {userId} (matches Firebase Auth UID)
+// Fields:
+//   - uid: string (required, immutable, 1..128 chars) - Firebase Auth UID
+//   - email: string (required, <= 254 chars, valid email) - User email address
+//   - displayName: string (optional/nullable, <= 100 chars) - User display name
+//   - photoURL: string (optional/nullable, <= 2000 chars) - User avatar URL
+//   - createdAt: timestamp (optional, immutable) - Profile creation timestamp
+//   - updatedAt: timestamp (required) - Profile last update timestamp
+//   - lastLoginAt: timestamp (optional) - Last login timestamp
+//
+// Collection: lists
+// Document ID: {listId} (auto-generated or custom ID)
+// Fields:
+//   - name: string (required, 1..100 chars) - List title
+//   - description: string (optional/nullable, 0..500 chars) - List description
+//   - ownerId: string (required, immutable, 1..128 chars) - Creator UID
+//   - ownerEmail: string (optional/nullable, immutable, <= 254 chars) - Creator email
+//   - ownerName: string (optional/nullable, <= 100 chars) - Creator display name
+//   - ownerPhotoURL: string (optional/nullable, <= 2000 chars) - Creator avatar URL
+//   - memberIds: list of strings (required, 1..100 items) - Collaborator UIDs (must include ownerId)
+//   - memberEmails: list of strings (optional, 0..100 items) - Collaborator email addresses
+//   - inviteCode: string (optional, 4..32 chars) - Short invite code for joining
+//   - createdAt: timestamp (required, immutable) - List creation timestamp
+//   - updatedAt: timestamp (required) - List last update timestamp
+//
+// Subcollection: lists/{listId}/todos
+// Document ID: {todoId} (auto-generated ID)
+// Fields:
+//   - text: string (required, 1..500 chars) - Task description
+//   - completed: bool (required) - Completion status
+//   - priority: string (optional, enum: 'low', 'medium', 'high') - Task priority
+//   - dueDate: string or timestamp (optional/nullable, <= 64 chars if string) - Due date
+//   - assigneeId: string (optional/nullable, <= 128 chars) - Assigned user UID
+//   - assigneeEmail: string (optional/nullable, <= 254 chars) - Assigned user email
+//   - assigneeName: string (optional/nullable, <= 100 chars) - Assigned user name
+//   - notes: string (optional/nullable, <= 2000 chars) - Optional task notes
+//   - createdBy: string (required, immutable, 1..128 chars) - Author UID
+//   - createdByName: string (optional/nullable, <= 100 chars) - Author display name
+//   - createdAt: timestamp (required, immutable) - Task creation timestamp
+//   - updatedAt: timestamp (required) - Task last update timestamp
+//   - completedAt: timestamp (optional/nullable) - Task completion timestamp
+//   - completedBy: string (optional/nullable, <= 128 chars) - UID of user who completed task
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if the user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if user owns the resource (for user-owned documents)
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Check if user is owner based on document's uid field
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+
+    // Verify UID hasn't been tampered with on create
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == request.auth.uid;
+    }
+
+    // Ensure uid field is not modified on update
+    function uidNotModified() {
+      return !('uid' in request.resource.data) ||
+        request.resource.data.uid == resource.data.uid;
+    }
+
+    // Validate required fields exist
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // Validate that the document contains only the allowed fields
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // Validate that the document hasn't changed in the fields that are not allowed to be changed
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Validate string length
+    function validStringLength(field, minLen, maxLen) {
+      return request.resource.data[field] is string &&
+        request.resource.data[field].size() >= minLen &&
+        request.resource.data[field].size() <= maxLen;
+    }
+
+    // Validate optional/nullable string length
+    function isValidOptionalString(field, minLen, maxLen) {
+      return !(field in request.resource.data) ||
+        request.resource.data[field] == null ||
+        (request.resource.data[field] is string &&
+         request.resource.data[field].size() >= minLen &&
+         request.resource.data[field].size() <= maxLen);
+    }
+
+    // Validate email format
+    function isValidEmail(email) {
+      return email is string &&
+        email.size() >= 3 &&
+        email.size() <= 254 &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // Validate that a list is a list and enforces size limits
+    function isValidList(list, maxSize) {
+      return list is list && list.size() <= maxSize;
+    }
+
+    // Check if the authenticated user is a member of a list document
+    function isListMember(listData) {
+      return isAuthenticated() && (
+        listData.ownerId == request.auth.uid ||
+        ('memberIds' in listData && request.auth.uid in listData.memberIds) ||
+        ('email' in request.auth.token &&
+         request.auth.token.email != null &&
+         'memberEmails' in listData &&
+         request.auth.token.email in listData.memberEmails)
+      );
+    }
+
+    // Check if the authenticated user is a member of the parent list
+    function isParentListMember(listId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/lists/$(listId)) &&
+        isListMember(get(/databases/$(database)/documents/lists/$(listId)).data);
+    }
+
+    // ===============================================================
+    // Domain Validators (Used in both create and update)
+    // ===============================================================
+
+    function isValidUserProfile(data, userId) {
+      return hasOnlyAllowedFields([
+          'uid', 'email', 'displayName', 'photoURL',
+          'createdAt', 'updatedAt', 'lastLoginAt'
+        ]) &&
+        hasRequiredFields(['uid', 'email', 'updatedAt']) &&
+        data.uid is string &&
+        data.uid == userId &&
+        data.uid.size() >= 1 &&
+        data.uid.size() <= 128 &&
+        isValidEmail(data.email) &&
+        isValidOptionalString('displayName', 0, 100) &&
+        isValidOptionalString('photoURL', 0, 2000) &&
+        (!('createdAt' in data) || data.createdAt is timestamp) &&
+        data.updatedAt is timestamp &&
+        (!('lastLoginAt' in data) || data.lastLoginAt is timestamp);
+    }
+
+    function isValidTodoList(data) {
+      return hasOnlyAllowedFields([
+          'name', 'description', 'ownerId', 'ownerEmail',
+          'ownerName', 'ownerPhotoURL', 'memberIds', 'memberEmails',
+          'inviteCode', 'createdAt', 'updatedAt'
+        ]) &&
+        hasRequiredFields(['name', 'ownerId', 'memberIds', 'createdAt', 'updatedAt']) &&
+        validStringLength('name', 1, 100) &&
+        isValidOptionalString('description', 0, 500) &&
+        validStringLength('ownerId', 1, 128) &&
+        isValidOptionalString('ownerEmail', 0, 254) &&
+        isValidOptionalString('ownerName', 0, 100) &&
+        isValidOptionalString('ownerPhotoURL', 0, 2000) &&
+        isValidList(data.memberIds, 100) &&
+        data.memberIds.size() >= 1 &&
+        data.ownerId in data.memberIds &&
+        (!('memberEmails' in data) || isValidList(data.memberEmails, 100)) &&
+        isValidOptionalString('inviteCode', 4, 32) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTodoItem(data) {
+      return hasOnlyAllowedFields([
+          'text', 'completed', 'priority', 'dueDate',
+          'assigneeId', 'assigneeEmail', 'assigneeName', 'notes',
+          'createdBy', 'createdByName', 'createdAt', 'updatedAt',
+          'completedAt', 'completedBy'
+        ]) &&
+        hasRequiredFields(['text', 'completed', 'createdBy', 'createdAt', 'updatedAt']) &&
+        validStringLength('text', 1, 500) &&
+        data.completed is bool &&
+        (!('priority' in data) || data.priority in ['low', 'medium', 'high']) &&
+        (!('dueDate' in data) || data.dueDate == null ||
+          (data.dueDate is string && data.dueDate.size() <= 64) ||
+          data.dueDate is timestamp) &&
+        isValidOptionalString('assigneeId', 0, 128) &&
+        isValidOptionalString('assigneeEmail', 0, 254) &&
+        isValidOptionalString('assigneeName', 0, 100) &&
+        isValidOptionalString('notes', 0, 2000) &&
+        validStringLength('createdBy', 1, 128) &&
+        isValidOptionalString('createdByName', 0, 100) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        (!('completedAt' in data) || data.completedAt == null || data.completedAt is timestamp) &&
+        isValidOptionalString('completedBy', 0, 128);
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // User Profiles
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+
+      allow create: if isOwner(userId) &&
+        uidUnchanged() &&
+        isValidUserProfile(request.resource.data, userId);
+
+      allow update: if isOwner(userId) &&
+        isDocOwner() &&
+        uidNotModified() &&
+        areImmutableFieldsUnchanged(['uid', 'createdAt']) &&
+        isValidUserProfile(request.resource.data, userId);
+
+      allow delete: if false;
+    }
+
+    // Collaborative To-Do Lists
+    match /lists/{listId} {
+      // Signed-in users can read lists they belong to or look up lists by inviteCode to join
+      allow read: if isAuthenticated();
+
+      allow create: if isAuthenticated() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.auth.uid in request.resource.data.memberIds &&
+        isValidTodoList(request.resource.data);
+
+      allow update: if isAuthenticated() &&
+        isValidTodoList(request.resource.data) &&
+        areImmutableFieldsUnchanged(['ownerId', 'ownerEmail', 'createdAt']) &&
+        (
+          // Existing members can update list details and collaborator lists
+          isListMember(resource.data) ||
+          // A signed-in user joining via invite code/link can only add themselves
+          (
+            areImmutableFieldsUnchanged(['ownerId', 'ownerEmail', 'name', 'description', 'inviteCode', 'createdAt']) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberIds', 'memberEmails', 'updatedAt']) &&
+            request.auth.uid in request.resource.data.memberIds &&
+            request.resource.data.memberIds.hasAll(resource.data.memberIds)
+          )
+        );
+
+      allow delete: if isAuthenticated() &&
+        resource.data.ownerId == request.auth.uid;
+
+      // To-Do Items within a List
+      match /todos/{todoId} {
+        allow read: if isParentListMember(listId);
+
+        allow create: if isParentListMember(listId) &&
+          request.resource.data.createdBy == request.auth.uid &&
+          isValidTodoItem(request.resource.data);
+
+        allow update: if isParentListMember(listId) &&
+          areImmutableFieldsUnchanged(['createdBy', 'createdAt']) &&
+          isValidTodoItem(request.resource.data);
+
+        allow delete: if isParentListMember(listId);
+      }
+    }
+
+    // Default deny for all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
